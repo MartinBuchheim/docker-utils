@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# docker-compose-updater.sh
+#
+# Scan a directory for Docker Compose files, pull all images,
+# and restart only currently running services.
+#
+# Usage:
+#   docker-compose-updater.sh [options] ROOT_DIR
+#
+# Options:
+#   -n, --non-interactive   Run without prompts (update all found compose files)
+#   -e, --exclude PATTERN   Exclude compose files by glob PATTERN (can be used multiple times)
+#                           Example: -e "*/legacy/*" -e "*stack-*.yml"
+#   -b, --build             Add --build to the 'up' command (rebuild local Dockerfiles)
+#   -h, --help              Show this help
+#
+# Examples:
+#   docker-compose-updater.sh /srv
+#   docker-compose-updater.sh -n /srv
+#   docker-compose-updater.sh -n -e "*/legacy/*" -e "*test-stack.yml" /srv
+#   docker-compose-updater.sh -n -b /srv
+
+SCRIPT_NAME="$(basename "$0")"
+NON_INTERACTIVE=false
+EXCLUDES=()
+BUILD=false
+
+print_help() {
+  cat <<EOF
+$SCRIPT_NAME
+
+Scan a directory for Docker Compose files, pull all images,
+and restart only currently running services.
+
+Usage:
+  $SCRIPT_NAME [options] ROOT_DIR
+
+Options:
+  -n, --non-interactive   Run without prompts (update all found compose files)
+  -e, --exclude PATTERN   Exclude compose files by glob PATTERN (can be used multiple times)
+                          Example: -e "*/legacy/*" -e "*stack-*.yml"
+  -b, --build             Add --build to the 'up' command (rebuild local Dockerfiles)
+  -h, --help              Show this help
+
+Examples:
+  $SCRIPT_NAME /srv
+  $SCRIPT_NAME -n /srv
+  $SCRIPT_NAME -n -e "*/legacy/*" -e "*test-stack.yml" /srv
+  $SCRIPT_NAME -n -b /srv
+EOF
+}
+
+error() {
+  echo "[$SCRIPT_NAME] ERROR: $*" >&2
+  exit 1
+}
+
+# Detect docker compose command (plugin vs classic)
+detect_compose_cmd() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker compose)
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker-compose)
+  else
+    error "Neither 'docker compose' nor 'docker-compose' is available in PATH."
+  fi
+}
+
+detect_compose_cmd
+
+# Check if a path should be excluded based on EXCLUDES glob patterns
+is_excluded() {
+  local path="$1"
+
+  # EXCLUDES is always defined (EXCLUDES=()), but keep this robust
+  if [ "${#EXCLUDES[@]}" -eq 0 ]; then
+    return 1
+  fi
+
+  local pattern
+  for pattern in "${EXCLUDES[@]}"; do
+    # Real glob match, e.g. "*/legacy/*" or "*stack-*.yml"
+    if [[ "$path" == $pattern ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Run update routine for a single docker compose file
+process_compose_file() {
+  local compose_file="$1"
+
+  if is_excluded "$compose_file"; then
+    echo "Skipping (excluded by glob): $compose_file"
+    return
+  fi
+
+  local dir
+  dir="$(dirname "$compose_file")"
+
+  if ! $NON_INTERACTIVE; then
+    echo
+    echo "Found compose file: $compose_file"
+    read -r -p "Pull all images and restart running services? [y/N] " answer
+    case "$answer" in
+      [yY]|[yY][eE][sS])
+        ;;
+      *)
+        echo "Skipping: $compose_file"
+        return
+        ;;
+    esac
+  else
+    echo
+    echo "Updating (non-interactive): $compose_file"
+  fi
+
+  (
+    cd "$dir"
+
+    echo "-> Pulling ALL images in $(pwd) ..."
+    # Pull all services, regardless of running state
+    "${COMPOSE_CMD[@]}" -f "$compose_file" pull
+
+    # Determine currently running services (to restart only those)
+    local services_raw=""
+    local -a svc_args=()
+
+    if "${COMPOSE_CMD[@]}" -f "$compose_file" ps --services --filter "status=running" >/dev/null 2>&1; then
+      # docker compose plugin supports --filter
+      services_raw="$("${COMPOSE_CMD[@]}" -f "$compose_file" ps --services --filter "status=running")"
+    else
+      # Fallback for older docker-compose: parse "Up" from ps output
+      services_raw="$("${COMPOSE_CMD[@]}" -f "$compose_file" ps 2>/dev/null | awk 'NR>2 && /Up/ {print $1}')"
+    fi
+
+    while IFS= read -r svc; do
+      [ -n "$svc" ] && svc_args+=( "$svc" )
+    done <<< "$services_raw"
+
+    if ((${#svc_args[@]} == 0)); then
+      echo "No running services for $compose_file – images pulled, nothing to restart."
+      return
+    fi
+
+    echo "-> Recreating running services in $(pwd): ${svc_args[*]}"
+
+    local -a up_cmd=( "${COMPOSE_CMD[@]}" -f "$compose_file" up -d --remove-orphans )
+    if $BUILD; then
+      up_cmd+=( --build )
+    fi
+    up_cmd+=( "${svc_args[@]}" )
+
+    "${up_cmd[@]}"
+
+    echo "-> Done: $compose_file"
+  )
+}
+
+# Parse args
+if [[ $# -lt 1 ]]; then
+  print_help
+  exit 1
+fi
+
+ROOT_DIR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--non-interactive)
+      NON_INTERACTIVE=true
+      shift
+      ;;
+    -e|--exclude)
+      [[ $# -ge 2 ]] || error "Option $1 requires a PATTERN argument."
+      EXCLUDES+=("$2")
+      shift 2
+      ;;
+    -b|--build)
+      BUILD=true
+      shift
+      ;;
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    -*)
+      error "Unknown option: $1"
+      ;;
+    *)
+      ROOT_DIR="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "${ROOT_DIR:-}" ]] || error "ROOT_DIR is required. See --help."
+[[ -d "$ROOT_DIR" ]] || error "ROOT_DIR is not a directory: $ROOT_DIR"
+
+echo "Using compose command: ${COMPOSE_CMD[*]}"
+echo "Scanning in: $ROOT_DIR"
+if [ "${#EXCLUDES[@]}" -gt 0 ]; then
+  echo "Exclude glob patterns:"
+  for p in "${EXCLUDES[@]}"; do
+    echo "  - $p"
+  done
+fi
+echo "Build with --build: $BUILD"
+echo "Behavior: pull ALL images, restart ONLY currently running services."
+echo
+
+# Collect compose files (macOS-safe)
+COMPOSE_FILES=()
+while IFS= read -r -d '' f; do
+  COMPOSE_FILES+=( "$f" )
+done < <(
+  find "$ROOT_DIR" -type f \( \
+    -iname "docker-compose.yml" -o \
+    -iname "docker-compose.yaml" -o \
+    -iname "compose.yml" -o \
+    -iname "compose.yaml" \
+  \) -print0 2>/dev/null
+)
+
+if ((${#COMPOSE_FILES[@]} == 0)); then
+  echo "No docker compose files found under: $ROOT_DIR"
+  exit 0
+fi
+
+# Sort result list
+IFS=$'\n' COMPOSE_FILES=($(printf '%s\n' "${COMPOSE_FILES[@]}" | sort)); unset IFS
+
+echo "Found ${#COMPOSE_FILES[@]} compose file(s)."
+
+for f in "${COMPOSE_FILES[@]}"; do
+  process_compose_file "$f"
+done
+
+echo
+echo "All done."
